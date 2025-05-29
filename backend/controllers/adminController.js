@@ -148,6 +148,7 @@ const adminDashboard = async (req, res) => {
     }
 }
 
+
 export {
     loginAdmin,
     appointmentsAdmin,

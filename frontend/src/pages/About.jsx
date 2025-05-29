@@ -1,6 +1,5 @@
 import React from 'react'
-// import { assets } from '../assets/assets'
-import RemediesPage from '/src/components/RemediesPage'
+import RemediesPage from '../components/RemediesPage'
 
 const About = () => {
   return (

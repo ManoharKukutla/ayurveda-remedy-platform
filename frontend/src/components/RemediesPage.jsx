@@ -3,101 +3,155 @@ import { FaEllipsisV, FaCopy, FaRegCopy, FaRegThumbsUp, FaRegThumbsDown } from "
 import axios from "axios";
 import { marked } from "marked";
 import { openDB } from 'idb';
+import { loadUserChats } from "../utils/storage";
 
 const GROQ_API_KEY = "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";
 
-// Storage constants
-const STORAGE_KEYS = {
-  CHAT_HISTORY: "ayurveda_chat_history",
-};
-
 // Initialize IndexedDB
 const initDB = async () => {
-  return openDB('AyurvedaDB', 1, {
+  return openDB('AyurvedaDB', 3, {
     upgrade(db) {
-      db.createObjectStore('chats', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('chats')) {
+        const store = db.createObjectStore('chats', { keyPath: 'id' });
+        store.createIndex('userId', 'userId', { unique: false });
+      }
       db.createObjectStore('appointments', { keyPath: 'id' });
+      db.createObjectStore('feedback', { keyPath: 'id' });
     }
   });
 };
 
-// Storage utilities with IndexedDB fallback
-const saveChatData = async (data) => {
-  try {
-    // Try localStorage first
-    saveToLocalStorage(STORAGE_KEYS.CHAT_HISTORY, data);
-    
-    // Also save to IndexedDB
-    const db = await initDB();
-    await db.put('chats', {
-      id: 'current_chat_history',
-      data: data,
-      updatedAt: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error("Error saving chat data:", error);
-  }
-};
+// Chat API Service
+const chatApi = {
+  saveChat: async (userId, chatData, sessionId = null) => {
+    try {
+      const response = await axios.post("/api/chat/save", {
+        userId,
+        messages: chatData.chats,
+        preview: chatData.preview,
+        sessionId
+      }, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` }
+      });
+      return response.data;
+    } catch (error) {
+      console.error("API save failed, using fallback:", error);
+      const db = await initDB();
+      await db.put('chats', { 
+        id: sessionId || Date.now(), 
+        userId, 
+        data: chatData 
+      });
+      return { success: true, chat: { sessionId: sessionId || Date.now() } };
+    }
+  },
 
-const loadChatData = async () => {
-  try {
-    // Try localStorage first
-    const localStorageData = loadFromLocalStorage(STORAGE_KEYS.CHAT_HISTORY);
-    if (localStorageData) return localStorageData;
-    
-    // Fallback to IndexedDB
-    const db = await initDB();
-    const storedData = await db.get('chats', 'current_chat_history');
-    return storedData?.data || [];
-  } catch (error) {
-    console.error("Error loading chat data:", error);
-    return [];
-  }
-};
-
-// Basic localStorage functions
-const saveToLocalStorage = (key, data) => {
-  try {
-    localStorage.setItem(key, JSON.stringify(data));
-  } catch (error) {
-    console.error("Error saving to localStorage:", error);
-    throw error; // Throw to trigger IndexedDB fallback
-  }
-};
-
-const loadFromLocalStorage = (key) => {
-  try {
-    const data = localStorage.getItem(key);
-    return data ? JSON.parse(data) : null;
-  } catch (error) {
-    console.error("Error loading from localStorage:", error);
-    return null;
-  }
-};
-
-const clearLocalStorageKey = (key) => {
-  localStorage.removeItem(key);
-};
-
-// Data expiration utilities
-const saveWithExpiry = (key, data, expiryDays) => {
-  const item = {
-    data,
-    expiry: Date.now() + expiryDays * 86400000
-  };
-  localStorage.setItem(key, JSON.stringify(item));
-};
-
-const loadWithExpiry = (key) => {
-  const itemStr = localStorage.getItem(key);
-  if (!itemStr) return null;
   
-  const item = JSON.parse(itemStr);
-  if (Date.now() > item.expiry) {
-    localStorage.removeItem(key);
-    return null;
+
+
+  loadHistory: async (userId) => {
+    try {
+      const response = await axios.post("/api/chat/history", { userId }, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` }
+      });
+      
+      // Transform backend data to frontend format
+      const apiChats = response.data.chats.map(chat => ({
+        sessionId: chat.sessionId,
+        preview: chat.preview,
+        createdAt: chat.createdAt,
+        messages: chat.messages.map(msg => ({
+          text: msg.text,
+          response: msg.response,
+          id: msg._id || Date.now(),
+          rawText: msg.rawText || msg.response
+        }))
+      }));
+  
+      // Also save to IndexedDB for offline use
+      const db = await initDB();
+      await Promise.all(
+        apiChats.map(chat => 
+          db.put('chats', {
+            id: chat.sessionId,
+            userId,
+            data: {
+              chats: chat.messages,
+              preview: chat.preview,
+              createdAt: chat.createdAt
+            }
+          })
+        )
+      );
+  
+      return apiChats;
+    } catch (error) {
+      console.error("API load failed, using fallback:", error);
+      const db = await initDB();
+      const chats = await db.getAll('chats');
+      return chats
+        .filter(chat => chat.userId === userId)
+        .map(chat => ({
+          sessionId: chat.id,
+          preview: chat.data.preview,
+          createdAt: chat.data.createdAt,
+          messages: chat.data.chats.map(msg => ({
+            text: msg.text,
+            response: msg.response,
+            id: msg.id || Date.now(),
+            rawText: msg.rawText || msg.response
+          }))
+        }));
+    }
+  },
+
+  deleteChat: async (userId, sessionId) => {
+    try {
+      await axios.post("/api/chat/delete", { userId, sessionId }, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` }
+      });
+    } catch (error) {
+      console.error("API delete failed, cleaning local:", error);
+      const db = await initDB();
+      await db.delete('chats', sessionId);
+    }
+  },
+
+  getUserId: async () => {
+    try {
+      const response = await axios.get("/api/user/verify-token", {
+        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` }
+      });
+      return response.data.userId;
+    } catch (error) {
+      console.error("Error verifying token:", error);
+      return null;
+    }
   }
-  return item.data;
+};
+
+// Input analysis function
+const analyzeInput = (input) => {
+  const lowerInput = input.toLowerCase();
+  
+  // Check for negations
+  if (/(no |not |don'?t |doesn'?t )/i.test(lowerInput)) {
+    const condition = input.match(/(no |not |don'?t |doesn'?t )(.+)/i)?.[2]?.trim() || "that condition";
+    return `The user indicates they do not have ${condition}. Respond appropriately without providing remedies.`;
+  }
+  
+  // Check if it's clearly a request for remedies
+  if (/(remedy|treatment|solution|help|advice|for)\b/i.test(lowerInput)) {
+    return `Provide complete Ayurvedic remedies for: ${input}`;
+  }
+  
+  // Check if it's just a symptom/condition mention
+  if (/(pain|ache|problem|issue|symptom|condition|disease)/i.test(lowerInput)) {
+    return `The user mentions "${input}". Provide Ayurvedic analysis and remedies if appropriate.`;
+  }
+  
+  // Default case - ask for clarification
+  return `The user said: "${input}". This doesn't clearly request Ayurvedic remedies. Ask for clarification if needed.`;
 };
 
 const RemediesPage = () => {
@@ -107,33 +161,47 @@ const RemediesPage = () => {
   const [showMenu, setShowMenu] = useState(false);
   const [selectedHistoryMenu, setSelectedHistoryMenu] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
   const [activeChatId, setActiveChatId] = useState(null);
   const [copiedIndex, setCopiedIndex] = useState(null);
+  const [error, setError] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [systemPrompt, setSystemPrompt] = useState('You are a helpful AI assistant.');
 
   const inputRef = useRef(null);
   const chatBoxRef = useRef(null);
 
-  // Load saved history when component mounts
+
   useEffect(() => {
     const loadHistory = async () => {
-      const savedHistory = await loadChatData();
-      if (savedHistory) {
-        setHistory(savedHistory);
+      setIsHistoryLoading(true);
+      setError(null);
+      try {
+        const userId = await chatApi.getUserId();
+        if (userId) {
+          // First try to load from API
+          const apiHistory = await chatApi.loadHistory(userId);
+          setHistory(apiHistory);
+          
+          // Then load from IndexedDB as fallback
+          const savedHistory = await loadUserChats(userId);
+          if (savedHistory.length > 0 && apiHistory.length === 0) {
+            setHistory(savedHistory);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to load history:", err);
+        setError("Failed to load chat history");
+      } finally {
+        setIsHistoryLoading(false);
       }
     };
     loadHistory();
-
-    // Setup tab sync
-    const handleStorageChange = (e) => {
-      if (e.key === STORAGE_KEYS.CHAT_HISTORY) {
-        setHistory(JSON.parse(e.newValue || '[]'));
-      }
-    };
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
   }, []);
 
-  // Auto-scroll to bottom when chat or loading state changes
+
+
+  // Auto-scroll to bottom when chat updates
   useEffect(() => {
     if (chatBoxRef.current) {
       chatBoxRef.current.scrollTo({
@@ -143,6 +211,8 @@ const RemediesPage = () => {
     }
   }, [chat, isLoading]);
 
+
+
   const copyToClipboard = (text, index) => {
     navigator.clipboard.writeText(text);
     setCopiedIndex(index);
@@ -150,6 +220,14 @@ const RemediesPage = () => {
   };
 
   const formatAyurvedicResponse = (text) => {
+    // Check for non-remedy responses
+    if (text.includes("not clear") || 
+        text.includes("please clarify") || 
+        text.includes("no specific condition") ||
+        text.includes("do not have")) {
+      return `<div class="whitespace-pre-wrap leading-relaxed">${text}</div>`;
+    }
+    
     let cleanedText = text.replace(/\*\*/g, '').replace(/\*/g, '').trim();
     let formatted = "";
     let currentSection = "";
@@ -232,11 +310,22 @@ const RemediesPage = () => {
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
 
+    // Simple validation - don't send very short inputs that are likely not real queries
+    if (input.trim().split(/\s+/).length < 2 && !input.match(/remedy|treatment|help/i)) {
+      setChat([...chat, {
+        text: input,
+        response: "Please provide more details about your health concern for accurate Ayurvedic advice.",
+        id: Date.now(),
+        rawText: ""
+      }]);
+      setInput("");
+      return;
+    }
+
     const userMessage = {
       text: input,
       response: "⏳ Waiting for AI response...",
       id: Date.now(),
-      suggestions: [],
       rawText: ""
     };
 
@@ -254,45 +343,33 @@ const RemediesPage = () => {
           messages: [
             {
               role: "system",
-              content: `You are an expert Ayurvedic doctor. Provide detailed Ayurvedic remedies with the following strict format:
+              content: `You are an expert Ayurvedic doctor. Analyze the user's input carefully and:
+              
+              1. If the user describes symptoms or asks for remedies, provide detailed Ayurvedic solutions
+              2. If the user mentions NOT having a condition (e.g., "I don't have headache"), respond appropriately
+              3. If the input is unclear, ask for clarification and Do not provide remedies
+              4. If the user asks general questions about Ayurveda, provide educational answers
 
-Disease Name: 
-[Exact name of the disease/condition]
+              When providing remedies, use this format:
 
-Causes:
-- Primary cause 1
-- Secondary cause 2
-- Underlying cause 3
+              Disease Name: [Condition]
+              Causes: [List]
+              Ayurvedic Remedies: [List]
+              Recommended Exercises: [List]
+              Diet Recommendations: [List]
+              Additional Notes: [Text]
 
-Ayurvedic Remedies:
-- Remedy 1 (with details)
-- Remedy 2 (with details)
-- Remedy 3 (with details)
-
-Recommended Exercises:
-- Exercise 1 (with frequency)
-- Exercise 2 (with duration)
-
-Diet Recommendations:
-- Food to include
-- Food to avoid
-- Recommended eating habits
-
-Additional Notes:
-[Any important precautions or special considerations]
-
-Formatting Rules:
-1. Always use these exact section headings ending with colons
-2. Each section must start on a new line
-3. List items must start with "- " and be on separate lines
-4. Never mix content between sections
-5. The Disease Name should be just the name, not a sentence
-6. Include practical, actionable advice
-7. Keep remedies traditional and authentic`
+              Formatting Rules:
+              1. Always use these exact section headings ending with colons
+              2. Each section must start on a new line
+              3. List items must start with "- " and be on separate lines
+              4. Never mix content between sections
+              5. Include practical, actionable advice
+              6. Keep remedies traditional and authentic`
             },
             {
               role: "user",
-              content: `Provide complete Ayurvedic remedies for: ${input}`
+              content: analyzeInput(input)
             }
           ],
           temperature: 0.7,
@@ -310,17 +387,38 @@ Formatting Rules:
       const aiText = response?.data?.choices?.[0]?.message?.content || "No response from AI.";
       const formattedResponse = formatAyurvedicResponse(aiText);
 
-      setChat((prevChat) =>
-        prevChat.map((msg) =>
-          msg.id === userMessage.id 
-            ? { ...msg, response: formattedResponse, rawText: aiText } 
-            : msg
-        )
+      const finalChat = updatedChat.map(msg => 
+        msg.id === userMessage.id 
+          ? { ...msg, response: formattedResponse, rawText: aiText } 
+          : msg
       );
+
+      setChat(finalChat);
+      
+      // Save to backend
+      const userId = await chatApi.getUserId();
+      if (userId) {
+        const sessionId = activeChatId || Date.now().toString();
+        await chatApi.saveChat(userId, {
+          chats: finalChat,
+          preview: finalChat[0].text
+        }, sessionId);
+
+        if (!activeChatId) {
+          setActiveChatId(sessionId);
+          // Update history state optimistically
+          setHistory(prev => [{
+            sessionId,
+            preview: finalChat[0].text.substring(0, 40),
+            createdAt: new Date().toISOString(),
+            messages: finalChat
+          }, ...prev]);
+        }
+      }
     } catch (error) {
       console.error("Error:", error);
-      setChat((prevChat) =>
-        prevChat.map((msg) =>
+      setChat(prevChat =>
+        prevChat.map(msg =>
           msg.id === userMessage.id
             ? {
                 ...msg,
@@ -334,290 +432,189 @@ Formatting Rules:
       setIsLoading(false);
     }
   };
+  
 
-  const handleNewChat = async () => {
-    if (chat.length > 0 && chat.some((msg) => msg.text.trim() !== "")) {
-      const newHistory = [
-        { 
-          id: Date.now(), 
-          chats: chat, 
-          preview: chat[0].text,
-          createdAt: new Date().toISOString(),
-          expiresAt: Date.now() + 30 * 86400000 // 30 days from now
-        },
-        ...history
-      ];
-      setHistory(newHistory);
-      await saveChatData(newHistory);
+const handleNewChat = async () => {
+  try {
+    setIsHistoryLoading(true);
+    
+    // Save current chat if it exists
+    if (chat.length > 0) {
+      const userId = await chatApi.getUserId();
+      if (userId) {
+        const sessionId = activeChatId || Date.now().toString();
+        await chatApi.saveChat(userId, {
+          chats: chat,
+          preview: chat[0]?.text || "New Chat",
+          createdAt: new Date().toISOString()
+        }, sessionId);
+      }
     }
+
+    // Reset chat state
     setChat([]);
     setInput("");
     setActiveChatId(null);
-    inputRef.current?.focus();
-  };
+    
+    // Create a new chat entry in history
+    const newSessionId = Date.now().toString();
+    setActiveChatId(newSessionId);
+    setHistory(prev => [{
+      sessionId: newSessionId,
+      preview: "New Chat",
+      createdAt: new Date().toISOString(),
+      messages: []
+    }, ...prev]);
 
-  const handleClearHistory = async () => {
+    inputRef.current?.focus();
+  } catch (error) {
+    console.error("Error creating new chat:", error);
+    setError("Failed to create new chat");
+  } finally {
+    setIsHistoryLoading(false);
+  }
+};
+
+// Also ensure these other handler functions are defined:
+const handleClearHistory = async () => {
+  try {
+    const userId = await chatApi.getUserId();
+    if (userId) {
+      const allChats = await loadUserChats(userId);
+      await Promise.all(
+        allChats.map(chat => chatApi.deleteChat(userId, chat.sessionId))
+      );
+    }
     setHistory([]);
     setActiveChatId(null);
     setChat([]);
     setShowMenu(false);
-    clearLocalStorageKey(STORAGE_KEYS.CHAT_HISTORY);
-    try {
-      const db = await initDB();
-      await db.clear('chats');
-    } catch (error) {
-      console.error("Error clearing IndexedDB:", error);
+  } catch (error) {
+    console.error("Error clearing history:", error);
+    setError("Failed to clear history");
+  }
+};
+
+const handleClearSingleChat = async (sessionId) => {
+  try {
+    const userId = await chatApi.getUserId();
+    if (userId) {
+      await chatApi.deleteChat(userId, sessionId);
     }
-  };
-
-  const handleClearSingleChat = async (id) => {
-    const updatedHistory = history.filter((item) => item.id !== id);
-    setHistory(updatedHistory);
-    await saveChatData(updatedHistory);
-
-    if (activeChatId === id) {
+    setHistory(prev => prev.filter(item => item.sessionId !== sessionId));
+    if (activeChatId === sessionId) {
       setActiveChatId(null);
       setChat([]);
     }
-
     setSelectedHistoryMenu(null);
-  };
+  } catch (error) {
+    console.error("Error deleting chat:", error);
+    setError("Failed to delete chat");
+  }
+};
 
-  const handleLoadChatFromHistory = (historyItem) => {
-    setChat(historyItem.chats);
-    setActiveChatId(historyItem.id);
-    inputRef.current?.focus();
-    setSelectedHistoryMenu(null);
-  };
+const handleLoadChatFromHistory = async (historyItem) => {
+  try {
+    setIsLoading(true);
+    
+    // Ensure we have messages to load
+    if (!historyItem?.messages?.length) {
+      throw new Error("No messages in this chat");
+    }
 
-  const handleFeedback = async (index, isPositive) => {
-    console.log(`Feedback for message ${index}: ${isPositive ? 'positive' : 'negative'}`);
-    // Save feedback to IndexedDB
+    // Transform messages with proper fallbacks
+    const formattedMessages = historyItem.messages.map(msg => ({
+      text: msg.text || 'No text',
+      response: msg.response || '<div>No response content</div>',
+      id: msg.id || msg._id || `msg-${Date.now()}`,
+      rawText: msg.rawText || msg.response || ''
+    }));
+
+    // Reset and set chat in separate operations
+    setChat([]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    setChat(formattedMessages);
+    
+    setActiveChatId(historyItem.sessionId);
+    
+    // Double ensure scroll works
+    setTimeout(() => {
+      if (chatBoxRef.current) {
+        chatBoxRef.current.scrollTo({
+          top: chatBoxRef.current.scrollHeight,
+          behavior: 'smooth'
+        });
+      }
+      inputRef.current?.focus();
+    }, 300);
+    
+  } catch (error) {
+    console.error("Error loading chat:", error);
+    setChat([{
+      text: "Error loading chat",
+      response: "Could not load the selected conversation",
+      id: Date.now(),
+      rawText: "Error loading chat history"
+    }]);
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+
+
+const exportChatHistory = () => {
+  const dataStr = JSON.stringify(history, null, 2);
+  const blob = new Blob([dataStr], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `ayurveda-chat-history-${new Date().toISOString()}.json`;
+  link.click();
+};
+
+const importChatHistory = async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = async (e) => {
     try {
-      const db = await initDB();
-      await db.put('feedback', {
-        id: Date.now(),
-        chatId: activeChatId,
-        messageIndex: index,
-        isPositive,
-        timestamp: new Date().toISOString()
-      });
+      const importedHistory = JSON.parse(e.target.result);
+      setHistory(importedHistory);
+      const userId = await chatApi.getUserId();
+      if (userId) {
+        await Promise.all(
+          importedHistory.map(chat => 
+            chatApi.saveChat(userId, {
+              chats: chat.messages,
+              preview: chat.preview,
+              createdAt: chat.createdAt
+            }, chat.sessionId)
+          )
+        );
+      }
     } catch (error) {
-      console.error("Error saving feedback:", error);
+      console.error("Error importing chat history:", error);
     }
   };
+  reader.readAsText(file);
+};
 
-  const exportChatHistory = () => {
-    const dataStr = JSON.stringify(history, null, 2);
-    const blob = new Blob([dataStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `ayurveda-chat-history-${new Date().toISOString()}.json`;
-    link.click();
-  };
-
-  const importChatHistory = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      try {
-        const importedHistory = JSON.parse(e.target.result);
-        setHistory(importedHistory);
-        await saveChatData(importedHistory);
-      } catch (error) {
-        console.error("Error importing chat history:", error);
-      }
-    };
-    reader.readAsText(file);
-  };
 
   return (
     <>
-      <div
-        className="flex h-full bg-[#121212] font-['Lato','Segoe_UI'] text-black"
+      <div className="flex h-full bg-[#121212] font-['Lato','Segoe_UI'] text-black"
         onClick={() => {
           setSelectedHistoryMenu(null);
           setShowMenu(false);
         }}
       >
-        <div className="w-1/4 bg-[#121212] flex flex-col overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-          <div className="p-[1px_20px_0px] mb-0">
-            <div className="flex justify-between items-center text-white mb-0 pt-5">
-              <h3>History</h3>
 
-              <div
-                className="cursor-pointer relative p-1 group"
-                onMouseLeave={() => setShowMenu(false)}
-              >
-                <FaEllipsisV
-                  className="hover:text-[#ff5a5a] transition-colors"
-                  onMouseEnter={() => setShowMenu(true)}
-                />
-                {showMenu && (
-                  <div
-                    className="absolute right-0 top-6 bg-[#3d3d3d] p-2 z-10 text-sm rounded-md shadow-md min-w-[150px] space-y-2"
-                    onMouseLeave={() => setShowMenu(false)}
-                  >
-                    <div
-                      className="p-2 hover:bg-[#ff5a5a] rounded cursor-pointer"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleClearHistory();
-                      }}
-                    >
-                      Clear All History
-                    </div>
-                    <div
-                      className="p-2 hover:bg-[#ff5a5a] rounded cursor-pointer"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        exportChatHistory();
-                      }}
-                    >
-                      Export History
-                    </div>
-                    <div className="p-2 hover:bg-[#ff5a5a] rounded cursor-pointer">
-                      <label htmlFor="import-history" className="cursor-pointer block">
-                        Import History
-                      </label>
-                      <input
-                        id="import-history"
-                        type="file"
-                        accept=".json"
-                        onChange={(e) => {
-                          e.stopPropagation();
-                          importChatHistory(e);
-                        }}
-                        className="hidden"
-                      />
-                    </div>
-                    <div
-                      className="p-2 hover:bg-[#ff5a5a] rounded cursor-pointer"
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        try {
-                          const db = await initDB();
-                          const allChats = await db.getAll('chats');
-                          console.log("All stored chats:", allChats);
-                        } catch (error) {
-                          console.error("Error retrieving all chats:", error);
-                        }
-                      }}
-                    >
-                      Debug Storage
-                    </div>
-                  </div>
-                )}
-              </div>
-
-
-
-              {/* <div
-                className="cursor-pointer relative p-1"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setShowMenu(!showMenu);
-                }}
-              >
-                <FaEllipsisV />
-                {showMenu && (
-                  <div className="absolute right-0 top-6 bg-[#3d3d3d] p-2 cursor-pointer z-10 text-sm rounded-md shadow-md min-w-[75px] hover:bg-[#ff5a5a]">
-                    <div onClick={handleClearHistory}>Clear All History</div>
-                    <div onClick={exportChatHistory}>Export History</div>
-                    <div>
-                      <label htmlFor="import-history" className="cursor-pointer block">
-                        Import History
-                      </label>
-                      <input 
-                        id="import-history" 
-                        type="file" 
-                        accept=".json" 
-                        onChange={importChatHistory} 
-                        className="hidden" 
-                      />
-                    </div>
-                    <div onClick={async () => {
-                      try {
-                        const db = await initDB();
-                        const allChats = await db.getAll('chats');
-                        console.log("All stored chats:", allChats);
-                      } catch (error) {
-                        console.error("Error retrieving all chats:", error);
-                      }
-                    }}>
-                      Debug Storage
-                    </div>
-                  </div>
-                )}
-              </div> */}
-            </div>
-          </div>
-
-          <div className="flex-grow overflow-y-auto p-[10px_20px_10px]">
-            {history.map((item) => (
-              <div
-                key={item.id}
-                className={`p-3 text-white rounded-md mb-2 cursor-pointer transition-all duration-200 text-sm relative ${
-                  activeChatId === item.id 
-                    ? "bg-[rgba(101,132,0,0.50)] font-medium" 
-                    : "hover:bg-[#3d3d3d]"
-                }`}
-                onClick={() => handleLoadChatFromHistory(item)}
-              >
-                <span>
-                  {item.preview.length > 40
-                    ? item.preview.slice(0, 40) + "..."
-                    : item.preview}
-                </span>
-                <small className="block text-[#aaa] text-xs">
-                  {new Date(item.createdAt).toLocaleString()}
-                  {item.expiresAt && (
-                    <span className="ml-2 text-[#888]">
-                      (Expires: {new Date(item.expiresAt).toLocaleDateString()})
-                    </span>
-                  )}
-                </small>
-
-                <div
-                  className="absolute top-3 right-2 group"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <FaEllipsisV
-                    className="cursor-pointer hover:text-[#ff5a5a] transition-colors"
-                    onMouseEnter={() => setSelectedHistoryMenu(item.id)}
-                  />
-                  {selectedHistoryMenu === item.id && (
-                    <div
-                      className="absolute right-0 top-6 bg-[#3d3d3d] p-2 cursor-pointer z-10 text-sm rounded-md shadow-md min-w-[75px] hover:bg-[#ff5a5a]"
-                      onClick={() => handleClearSingleChat(item.id)}
-                      onMouseLeave={() => setSelectedHistoryMenu(null)}
-                    >
-                      Delete Chat
-                    </div>
-                  )}
-                </div>
-
-
-                {/* <div className="absolute top-3 right-2" onClick={(e) => e.stopPropagation()}>
-                  <FaEllipsisV onClick={() => setSelectedHistoryMenu(item.id)} />
-                  {selectedHistoryMenu === item.id && (
-                    <div
-                      className="absolute right-0 top-6 bg-[#3d3d3d] p-2 cursor-pointer z-10 text-sm rounded-md shadow-md min-w-[75px] hover:bg-[#ff5a5a]"
-                      onClick={() => handleClearSingleChat(item.id)}
-                    >
-                      Delete Chat
-                    </div>
-                  )}
-                </div> */}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex-grow w-4/5 flex items-center flex-col h-[87vh] bg-[url('/src/assets/chat-background.png')] bg-cover bg-center bg-no-repeat" onClick={(e) => e.stopPropagation()}>
+        {/* Main Chat Area */}
+        <div className="flex-grow w-4/5 flex items-center flex-col h-[87vh] bg-[url('/src/assets/chat-background.png')] bg-cover bg-center bg-no-repeat" 
+          onClick={(e) => e.stopPropagation()}>
+          
           <div className="flex-1 p-5 w-[750px] overflow-y-auto scroll-smooth flex items-center flex-col" ref={chatBoxRef}>
             {chat.length === 0 && !isLoading && (
               <div className="p-[30px_20px] text-center max-w-[600px] mx-auto">
@@ -629,6 +626,7 @@ Formatting Rules:
                   <li className="mb-2 leading-relaxed text-[#aeaeae]">"How to treat arthritis with Ayurveda"</li>
                   <li className="mb-2 leading-relaxed text-[#aeaeae]">"Natural solutions for digestion problems"</li>
                   <li className="mb-2 leading-relaxed text-[#aeaeae]">"Home remedies for common cold in Ayurveda"</li>
+                  <li className="mb-2 leading-relaxed text-[#aeaeae]">"I don't have headache but feel dizzy"</li>
                 </ul>
               </div>
             )}
@@ -647,39 +645,25 @@ Formatting Rules:
                     <button 
                       onClick={() => copyToClipboard(entry.rawText, index)}
                       className="bg-transparent text-white rounded-full w-7 h-7 flex items-center justify-center cursor-pointer transition-all duration-200 hover:bg-[#3d3d3d] hover:scale-110"
-                      title="Copy to clipboard"
-                    >
+                      title="Copy to clipboard">
                       {copiedIndex === index ? <FaCopy color="#E78D00" /> : <FaRegCopy />}
                     </button>
                     <div className="flex gap-2">
                       <button 
                         onClick={() => handleFeedback(index, true)} 
                         className="bg-transparent text-white rounded-full w-7 h-7 flex items-center justify-center cursor-pointer transition-all duration-200 hover:bg-[#3d3d3d] hover:scale-110"
-                        title="Helpful"
-                      >
+                        title="Helpful">
                         <FaRegThumbsUp />
                       </button>
                       <button 
                         onClick={() => handleFeedback(index, false)} 
                         className="bg-transparent text-white rounded-full w-7 h-7 flex items-center justify-center cursor-pointer transition-all duration-200 hover:bg-[#3d3d3d] hover:scale-110"
-                        title="Not helpful"
-                      >
+                        title="Not helpful">
                         <FaRegThumbsDown />
                       </button>
                     </div>
                   </div>
                 </div>
-
-                {entry.suggestions?.length > 0 && (
-                  <div className="mt-4 bg-[rgba(255,251,230,0.9)] border-l-4 border-[#fdd835] p-3 rounded-r-md">
-                    <strong className="block mb-2 text-[#5d4037]">Suggestions:</strong>
-                    <ul className="pl-5 m-0">
-                      {entry.suggestions.map((sug, i) => (
-                        <li key={i} className="mb-2 leading-relaxed text-[#aeaeae]">{sug}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
               </div>
             ))}
 
@@ -694,11 +678,11 @@ Formatting Rules:
             )}
           </div>
 
+          {/* Input Area */}
           <div className="p-4 border-none flex justify-center items-center gap-8 w-[700px] mb-8">
             <button 
               className="bg-[#E78D00] text-white border-none py-1 px-4 rounded-md cursor-pointer font-medium transition-all duration-200 w-fit h-10 min-w-[80px] hover:bg-[#ffb640]" 
-              onClick={handleNewChat}
-            >
+              onClick={handleNewChat}>
               + New Chat
             </button>
             <div className="bg-[#3d3d3d] rounded-full flex items-center justify-center gap-0 p-2">
@@ -716,8 +700,7 @@ Formatting Rules:
               <button 
                 className="bg-[#E78D00] text-white border-none py-auto px-5 rounded-full cursor-pointer font-medium transition-all duration-200 min-w-[80px] h-10 disabled:bg-[rgba(101,132,0,0.30)] disabled:cursor-not-allowed" 
                 onClick={handleSend} 
-                disabled={isLoading || !input.trim()}
-              >
+                disabled={isLoading || !input.trim()}>
                 {isLoading ? "..." : "Send"}
               </button>
             </div>
@@ -729,3 +712,5 @@ Formatting Rules:
 };
 
 export default RemediesPage;
+
+

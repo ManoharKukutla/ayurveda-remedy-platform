@@ -17,4 +17,11 @@ userRouter.post("/verifyRazorpay", authUser, verifyRazorpay)
 userRouter.post("/payment-stripe", authUser, paymentStripe)
 userRouter.post("/verifyStripe", authUser, verifyStripe)
 
+userRouter.get("/verify-token", authUser, (req, res) => {
+    res.json({ 
+      success: true,
+      userId: req.body.userId 
+    });
+  });
+
 export default userRouter;

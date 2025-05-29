@@ -1,11 +1,12 @@
 import React from 'react'
+import BlogList from '../components/BlogList'
 import { assets } from '../assets/assets'
 
 const Contact = () => {
   return (
-    <div>
-      <h1 className='text-white text-3xl'>Stil on work</h1>
-    </div>
+    <>
+      <BlogList />
+    </>
   )
 }
 
